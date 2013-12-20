@@ -43,6 +43,7 @@ object ErrorMapping {
   val StaleControllerEpochCode: Short = 11
   val OffsetMetadataTooLargeCode: Short = 12
   val StaleLeaderEpochCode: Short = 13
+  val OffsetLoadingNotCompleteCode: Short = 14
 
   private val exceptionToCode = 
     Map[Class[Throwable], Short](

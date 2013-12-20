@@ -52,10 +52,11 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
   var kafkaController: KafkaController = null
   val kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
   var zkClient: ZkClient = null
+  var offsetManager: OffsetManager = null
 
   /**
    * Start up API for bringing up a single instance of the Kafka server.
-   * Instantiates the LogManager, the SocketServer and the request handlers - KafkaRequestHandlers
+   * Instantiates the LogManager, the OffsetManager, the SocketServer and the request handlers - KafkaRequestHandlers
    */
   def startup() {
     info("starting")
@@ -84,9 +85,10 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
 
     replicaManager = new ReplicaManager(config, time, zkClient, kafkaScheduler, logManager, isShuttingDown)
     kafkaController = new KafkaController(config, zkClient)
+    offsetManager = OffsetManager.getOffsetManager(config, logManager)
     
     /* start processing requests */
-    apis = new KafkaApis(socketServer.requestChannel, replicaManager, zkClient, config.brokerId, config, kafkaController)
+    apis = new KafkaApis(socketServer.requestChannel, replicaManager, zkClient, config.brokerId, config, offsetManager, kafkaController)
     requestHandlerPool = new KafkaRequestHandlerPool(config.brokerId, socketServer.requestChannel, apis, config.numIoThreads)
    
     Mx4jLoader.maybeLoad()
@@ -102,9 +104,9 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
     kafkaHealthcheck = new KafkaHealthcheck(config.brokerId, config.advertisedHostName, config.advertisedPort, config.zkSessionTimeoutMs, zkClient)
     kafkaHealthcheck.startup()
 
-    
     registerStats()
-    startupComplete.set(true);
+    offsetManager.startup()
+    startupComplete.set(true)
     info("started")
   }
   
@@ -225,6 +227,8 @@ class KafkaServer(val config: KafkaConfig, time: Time = SystemTime) extends Logg
       Utils.swallow(kafkaScheduler.shutdown())
       if(apis != null)
         Utils.swallow(apis.close())
+      if(offsetManager != null)
+        Utils.swallow(offsetManager.shutdown())
       if(replicaManager != null)
         Utils.swallow(replicaManager.shutdown())
       if(logManager != null)

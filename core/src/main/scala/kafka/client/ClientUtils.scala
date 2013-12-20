@@ -5,7 +5,7 @@
  * The ASF licenses this file to You under the Apache License, Version 2.0
  * (the "License"); you may not use this file except in compliance with
  * the License.  You may obtain a copy of the License at
- * 
+ *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
@@ -14,7 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
- package kafka.client
+package kafka.client
 
 import scala.collection._
 import kafka.cluster._
@@ -24,6 +24,9 @@ import kafka.common.KafkaException
 import kafka.utils.{Utils, Logging}
 import java.util.Properties
 import util.Random
+import kafka.network.BlockingChannel
+import kafka.utils.ZkUtils._
+import org.I0Itec.zkclient.ZkClient
 
 /**
  * Helper functions common to clients (producer, consumer, or admin)
@@ -54,7 +57,7 @@ object ClientUtils extends Logging{
         fetchMetaDataSucceeded = true
       }
       catch {
-        case e: Throwable =>
+        case e : Throwable =>
           warn("Fetching topic metadata with correlation id %d for topics [%s] from broker [%s] failed"
             .format(correlationId, topics, shuffledBrokers(i).toString), e)
           t = e
@@ -103,5 +106,48 @@ object ClientUtils extends Logging{
       new Broker(brokerId, hostName, port)
     })
   }
-  
+
+  /**
+   * Creates a blocking channel to any random broker
+   */
+  def createChannelToRandomBroker(zkClient: ZkClient) : BlockingChannel = {
+    var channel: BlockingChannel = null
+    val allBrokers = getAllBrokersInCluster(zkClient)
+
+    Random.shuffle(allBrokers)
+      .toStream
+      .takeWhile { broker =>
+      try {
+        /* Pick the i'th broker from the shuffled list and attempt to establish a channel to it. If the channel connects
+         * well, break the loop or else keep trying further until all the brokers are attempted. */
+        trace("Establishing a channel with the broker at [host,port] = [" + broker.host + "," + broker.port + "]")
+        channel = new BlockingChannel(broker.host, broker.port, BlockingChannel.UseDefaultBufferSize, BlockingChannel.UseDefaultBufferSize, 3000)
+        channel.connect()
+      } catch {
+        case e: Exception =>
+          channel = null
+          trace("Error while establishing offset fetch channel with " + broker, e)
+      }
+      channel == null
+    }
+
+    if(channel == null)
+      throw new KafkaException("Unable to establish a channel with any of the live brokers in " + allBrokers.mkString(","))
+    channel
+  }
+
+  /**
+   * Performs shutdown of a given channel if its connected
+   */
+  def shutdownChannel(channel: BlockingChannel) {
+    if(channel != null && channel.isConnected)
+      channel.disconnect()
+  }
+
+  def createOffsetCommitProducer(zkClient: ZkClient) : Producer[Array[Byte], Array[Byte]] = {
+    val props = new Properties()
+    props.put("request.required.acks", "-1")
+    props.put("metadata.broker.list", getAllBrokersInCluster(zkClient).map(broker => broker.host + ":" + broker.port).mkString(","))
+    new Producer[Array[Byte], Array[Byte]] (new ProducerConfig(props))
+  }
 }

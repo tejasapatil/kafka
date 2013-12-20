@@ -27,7 +27,7 @@ import org.I0Itec.zkclient.exception.ZkNodeExistsException
 import java.net.InetAddress
 import org.I0Itec.zkclient.{IZkDataListener, IZkStateListener, IZkChildListener, ZkClient}
 import org.apache.zookeeper.Watcher.Event.KeeperState
-import java.util.UUID
+import java.util.{Properties, UUID}
 import kafka.serializer._
 import kafka.utils.ZkUtils._
 import kafka.utils.Utils.inLock
@@ -35,7 +35,11 @@ import kafka.common._
 import com.yammer.metrics.core.Gauge
 import kafka.metrics._
 import scala.Some
-
+import kafka.network.BlockingChannel
+import kafka.producer.{KeyedMessage, ProducerConfig, Producer}
+import util.Random
+import kafka.server.OffsetManager
+import kafka.api.{OffsetFetchResponse, OffsetFetchRequest}
 
 /**
  * This class handles the consumers interaction with zookeeper
@@ -83,7 +87,11 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
   private val isShuttingDown = new AtomicBoolean(false)
   private val rebalanceLock = new Object
   private var fetcher: Option[ConsumerFetcherManager] = None
-  private var zkClient: ZkClient = null
+  private val zkClient: ZkClient = connectZk()
+  private var offsetFetchChannel: BlockingChannel = createOffsetFetchChannel()
+  private var offsetFetchChannelLock = new Object
+  private var offsetCommitProducer: Producer[String, String] = createOffsetCommitProducer()
+  private var offsetCommitProducerLock = new Object
   private var topicRegistry = new Pool[String, Pool[Int, PartitionTopicInfo]]
   private var checkpointedOffsets = new Pool[TopicAndPartition, Long]
   private val topicThreadIdAndQueues = new Pool[(String,String), BlockingQueue[FetchedDataChunk]]
@@ -111,7 +119,6 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
   }
   this.logIdent = "[" + consumerIdString + "], "
 
-  connectZk()
   createFetcher()
   if (config.autoCommitEnable) {
     scheduler.startup
@@ -151,9 +158,9 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
       fetcher = Some(new ConsumerFetcherManager(consumerIdString, config, zkClient))
   }
 
-  private def connectZk() {
-    info("Connecting to zookeeper instance at " + config.zkConnect)
-    zkClient = new ZkClient(config.zkConnect, config.zkSessionTimeoutMs, config.zkConnectionTimeoutMs, ZKStringSerializer)
+  private def connectZk() : ZkClient = {
+      info("Connecting to zookeeper instance at " + config.zkConnect)
+      new ZkClient(config.zkConnect, config.zkSessionTimeoutMs, config.zkConnectionTimeoutMs, ZKStringSerializer)
   }
 
   def shutdown() {
@@ -174,10 +181,11 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
           sendShutdownToAllQueues()
           if (config.autoCommitEnable)
             commitOffsets()
-          if (zkClient != null) {
+          if (zkClient != null)
             zkClient.close()
-            zkClient = null
-          }
+
+          offsetFetchChannelLock synchronized shutdownOffsetFetchChannel()
+          offsetCommitProducerLock synchronized shutdownOffsetCommitProducer()
         } catch {
           case e: Throwable =>
             fatal("error during consumer connector shutdown", e)
@@ -249,26 +257,71 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
     }
   }
 
-  def commitOffsets() {
-    if (zkClient == null) {
-      error("zk client is null. Cannot commit offsets")
-      return
+  private def createOffsetFetchChannel() : BlockingChannel = {
+    var channel: BlockingChannel = null
+
+    Random.shuffle(getAllBrokersInCluster(zkClient))
+      .toStream
+      .takeWhile { broker =>
+      try {
+        /* Pick the i'th broker from the shuffled list and attempt to establish a channel to it. If the channel connects
+         * well, break the loop or else keep trying further until all the brokers are attempted. */
+        trace("Establishing a channel with the broker at [host,port] = [" + broker.host + "," + broker.port + "]")
+        channel = new BlockingChannel(broker.host, broker.port, BlockingChannel.UseDefaultBufferSize, BlockingChannel.UseDefaultBufferSize, 3000)
+        channel.connect()
+      } catch {
+        case e: Exception =>
+          channel = null
+          trace("Error while establishing offset fetch channel with " + broker, e)
+      }
+      channel == null
     }
-    for ((topic, infos) <- topicRegistry) {
-      val topicDirs = new ZKGroupTopicDirs(config.groupId, topic)
-      for (info <- infos.values) {
-        val newOffset = info.getConsumeOffset
-        if (newOffset != checkpointedOffsets.get(TopicAndPartition(topic, info.partitionId))) {
-          try {
-            updatePersistentPath(zkClient, topicDirs.consumerOffsetDir + "/" + info.partitionId, newOffset.toString)
-            checkpointedOffsets.put(TopicAndPartition(topic, info.partitionId), newOffset)
-          } catch {
-            case t: Throwable =>
-              // log it and let it go
-              warn("exception during commitOffsets",  t)
-          }
-          debug("Committed offset " + newOffset + " for topic " + info)
-        }
+
+    if(channel == null)
+      throw new KafkaException("Unable to establish a channel with any of the live brokers.")
+    channel
+  }
+
+  private def shutdownOffsetFetchChannel() {
+    if(offsetFetchChannel != null && offsetFetchChannel.isConnected)
+      offsetFetchChannel.disconnect()
+
+    offsetFetchChannel = null
+  }
+
+  private def createOffsetCommitProducer() : Producer[String, String] = {
+    val props = new Properties()
+    props.put("request.required.acks", "-1")
+    props.put("serializer.class", classOf[StringEncoder].getCanonicalName)
+    props.put("key.serializer.class", classOf[StringEncoder].getCanonicalName)
+    props.put("metadata.broker.list", getAllBrokersInCluster(zkClient).map(broker => broker.host + ":" + broker.port).mkString(","))
+    new Producer[String, String](new ProducerConfig(props))
+  }
+
+  private def shutdownOffsetCommitProducer() {
+    if (offsetCommitProducer != null) {
+      offsetCommitProducer.close()
+      offsetCommitProducer = null
+    }
+  }
+
+  def commitOffsets() {
+    offsetCommitProducerLock synchronized {
+      if (offsetCommitProducer == null)
+        offsetCommitProducer = createOffsetCommitProducer()
+
+      try {
+        debug("Sending offset commit request.")
+        offsetCommitProducer.send(topicRegistry.flatMap(t => t._2.values.map( partitionInfo =>
+          KeyedMessage[String, String](OffsetManager.OffsetsTopicName,
+            OffsetManager.offsetCommitKey(config.groupId, t._1, partitionInfo.partitionId),
+            config.groupId,
+            OffsetManager.offsetCommitValue(partitionInfo.getConsumeOffset()))
+        )).toSeq: _*)
+      } catch {
+        case t: Throwable =>       // log it and let it go
+          shutdownOffsetCommitProducer()
+          warn("Exception during commitOffsets", t)
       }
     }
   }
@@ -612,14 +665,35 @@ private[kafka] class ZookeeperConsumerConnector(val config: ConsumerConfig,
                                       topic: String, consumerThreadId: String) {
       val partTopicInfoMap = currentTopicRegistry.get(topic)
 
-      val znode = topicDirs.consumerOffsetDir + "/" + partition
-      val offsetString = readDataMaybeNull(zkClient, znode)._1
-      // If first time starting a consumer, set the initial offset to -1
-      val offset =
-        offsetString match {
-          case Some(offsetStr) => offsetStr.toLong
-          case None => PartitionTopicInfo.InvalidOffset
+      val currTopicPartition = TopicAndPartition(topic, partition)
+      val gtp = GroupTopicPartition(config.groupId, currTopicPartition)
+
+      val response = offsetFetchChannelLock synchronized {
+        try {
+          debug("Sending offset fetch request for %s".format(gtp))
+          if (offsetFetchChannel == null || !offsetFetchChannel.isConnected)
+            createOffsetFetchChannel()
+
+          offsetFetchChannel.send(OffsetFetchRequest(config.groupId, Seq(currTopicPartition), OffsetFetchRequest.CurrentVersion, 0, "consumer-" + consumerIdString))
+          offsetFetchChannel.receive()
+        } catch {
+          case t: Throwable =>
+            warn("Error in offset fetch request on " + gtp, t)
+            shutdownOffsetFetchChannel()
+            throw t
         }
+      }
+
+      val offsetFetchResponse = OffsetFetchResponse.readFrom(response.buffer)
+
+      /* If the offset is being loaded at the broker end, fail this offset fetch request. For rest errors, the offset would be -1 */
+      if(offsetFetchResponse.requestInfo.count(_._2.error == ErrorMapping.OffsetLoadingNotCompleteCode) > 0)
+        throw new InvalidOffsetException("Offset fetch request could not fetch all requested offsets as some offsets are being loaded.")
+
+      val topicPartitionAndOffsetMetadataMap = offsetFetchResponse.requestInfoGroupedByTopic(topic)
+      val offset = topicPartitionAndOffsetMetadataMap(currTopicPartition).offset
+      debug("Response for offset fetch on %s is %d".format(gtp,offset))
+
       val queue = topicThreadIdAndQueues.get((topic, consumerThreadId))
       val consumedOffset = new AtomicLong(offset)
       val fetchedOffset = new AtomicLong(offset)

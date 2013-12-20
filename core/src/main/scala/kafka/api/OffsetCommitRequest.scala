@@ -43,8 +43,9 @@ object OffsetCommitRequest extends Logging {
       (1 to partitionCount).map(_ => {
         val partitionId = buffer.getInt
         val offset = buffer.getLong
+        val timestamp = buffer.getLong
         val metadata = readShortString(buffer)
-        (TopicAndPartition(topic, partitionId), OffsetMetadataAndError(offset, metadata))
+        (TopicAndPartition(topic, partitionId), OffsetMetadataAndError(offset, timestamp, metadata))
       })
     })
     OffsetCommitRequest(consumerGroupId, Map(pairs:_*), versionId, correlationId, clientId)
@@ -75,6 +76,7 @@ case class OffsetCommitRequest(groupId: String,
       t1._2.foreach( t2 => {
         buffer.putInt(t2._1.partition)  // partition
         buffer.putLong(t2._2.offset)    // offset
+        buffer.putLong(t2._2.timestamp)    // timestamp
         writeShortString(buffer, t2._2.metadata) // metadata
       })
     })
@@ -95,6 +97,7 @@ case class OffsetCommitRequest(groupId: String,
         innerCount +
         4 /* partition */ +
         8 /* offset */ +
+        8 /* timestamp */ +
         shortStringLength(offsetAndMetadata._2.metadata)
       })
     })

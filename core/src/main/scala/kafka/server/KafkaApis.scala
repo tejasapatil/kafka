@@ -17,25 +17,31 @@
 
 package kafka.server
 
-import kafka.admin.AdminUtils
+import kafka.admin.{AdminOperationException, AdminUtils}
 import kafka.api._
 import kafka.message._
 import kafka.network._
 import kafka.log._
-import kafka.utils.ZKGroupTopicDirs
-import org.apache.log4j.Logger
 import scala.collection._
-import java.util.Properties
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic._
+import java.util.Properties
 import kafka.metrics.KafkaMetricsGroup
 import org.I0Itec.zkclient.ZkClient
 import kafka.common._
-import kafka.utils.{ZkUtils, Pool, SystemTime, Logging}
-import kafka.network.RequestChannel.Response
+import kafka.utils._
 import kafka.cluster.Broker
 import kafka.controller.KafkaController
-
+import scala.Predef._
+import scala.collection.Map
+import scala.collection.Set
+import scala.None
+import kafka.api.PartitionOffsetsResponse
+import scala.Some
+import kafka.api.ProducerResponseStatus
+import kafka.common.TopicAndPartition
+import kafka.network.RequestChannel.Response
+import kafka.api.PartitionFetchInfo
 
 /**
  * Logic to handle the various Kafka requests
@@ -45,6 +51,7 @@ class KafkaApis(val requestChannel: RequestChannel,
                 val zkClient: ZkClient,
                 val brokerId: Int,
                 val config: KafkaConfig,
+                val offsetManager: OffsetManager,
                 val controller: KafkaController) extends Logging {
 
   private val producerRequestPurgatory =
@@ -58,6 +65,7 @@ class KafkaApis(val requestChannel: RequestChannel,
     new mutable.HashMap[TopicAndPartition, PartitionStateInfo]()
   private val aliveBrokers: mutable.Map[Int, Broker] = new mutable.HashMap[Int, Broker]()
   private val partitionMetadataLock = new Object
+  private val offsetFetchChannelPool: Pool[Int, BlockingChannel] = new Pool[Int, BlockingChannel]
   this.logIdent = "[KafkaApi-%d] ".format(brokerId)
 
   /**
@@ -90,7 +98,7 @@ class KafkaApis(val requestChannel: RequestChannel,
   def handleLeaderAndIsrRequest(request: RequestChannel.Request) {
     val leaderAndIsrRequest = request.requestObj.asInstanceOf[LeaderAndIsrRequest]
     try {
-      val (response, error) = replicaManager.becomeLeaderOrFollower(leaderAndIsrRequest)
+      val (response, error) = replicaManager.becomeLeaderOrFollower(leaderAndIsrRequest, offsetManager)
       val leaderAndIsrResponse = new LeaderAndIsrResponse(leaderAndIsrRequest.correlationId, response, error)
       requestChannel.sendResponse(new Response(request, new BoundedByteBufferSend(leaderAndIsrResponse)))
     } catch {
@@ -160,6 +168,21 @@ class KafkaApis(val requestChannel: RequestChannel,
   }
 
   /**
+   * Checks if the current topic is the offsets topic and commits those offsets via the offset manager
+   */
+  def commitIfOffsetsTopic(produceRequest: ProducerRequest, statuses: Map[TopicAndPartition, ProducerResponseStatus]) {
+    if (produceRequest.data.keySet.exists(_.topic == OffsetManager.OffsetsTopicName)) {
+      produceRequest.data
+        .filter (t => statuses(t._1).error == ErrorMapping.NoError)
+        .foreach(_._2.map { m =>
+        val parsedMessage = new OffsetManager.KeyValue(m.message)
+        offsetManager.putOffset(parsedMessage.key, parsedMessage.value)
+      })
+      produceRequest.emptyData()
+    }
+  }
+
+  /**
    * Handle a produce request
    */
   def handleProducerRequest(request: RequestChannel.Request) {
@@ -179,6 +202,11 @@ class KafkaApis(val requestChannel: RequestChannel,
       // no operation needed if producer request.required.acks = 0; however, if there is any exception in handling the request, since
       // no response is expected by the producer the handler will send a close connection response to the socket server
       // to close the socket so that the producer client will know that some exception has happened and will refresh its metadata
+
+      // TODO : TEJAS For offsets topic, offsets are added by offset manager only if there were no errors.
+      // val statuses = localProduceResults.map(r => r.key -> ProducerResponseStatus(r.errorCode, r.start)).toMap
+      // commitIfOffsetsTopic(produceRequest, statuses)
+
       if (numPartitionsInError != 0) {
         info(("Send the close connection response due to error handling produce request " +
           "[clientId = %s, correlationId = %s, topicAndPartition = %s] with Ack=0")
@@ -192,6 +220,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         allPartitionHaveReplicationFactorOne ||
         numPartitionsInError == produceRequest.numPartitions) {
       val statuses = localProduceResults.map(r => r.key -> ProducerResponseStatus(r.errorCode, r.start)).toMap
+      commitIfOffsetsTopic(produceRequest, statuses)
       val response = ProducerResponse(produceRequest.correlationId, statuses)
       requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
     } else {
@@ -218,8 +247,9 @@ class KafkaApis(val requestChannel: RequestChannel,
       debug(satisfiedProduceRequests.size +
         " producer requests unblocked during produce to local log.")
       satisfiedProduceRequests.foreach(_.respond())
-      // we do not need the data anymore
-      produceRequest.emptyData()
+      // we do not need the data anymore (except if its the offsets topic wherein the data is needed to commit offsets)
+      if(!produceRequest.data.keySet.exists(_.topic == OffsetManager.OffsetsTopicName))
+        produceRequest.emptyData()
     }
   }
   
@@ -572,17 +602,23 @@ class KafkaApis(val requestChannel: RequestChannel,
       topicMetadata.errorCode match {
         case ErrorMapping.NoError => topicsMetadata += topicMetadata
         case ErrorMapping.UnknownTopicOrPartitionCode =>
-          if (config.autoCreateTopicsEnable) {
-            try {
-              AdminUtils.createTopic(zkClient, topicMetadata.topic, config.numPartitions, config.defaultReplicationFactor)
+          try {
+            if (config.autoCreateTopicsEnable || topicMetadata.topic == OffsetManager.OffsetsTopicName) {
+              val (numPartitions, replicationFactor, properties) =
+                if (topicMetadata.topic == OffsetManager.OffsetsTopicName)
+                  (config.offsetTopicPartitions, config.offsetTopicReplicationFactor, OffsetManager.OffsetsTopicProperties)
+                else
+                  (config.numPartitions, config.defaultReplicationFactor, new Properties)
+              AdminUtils.createTopic(zkClient, topicMetadata.topic, numPartitions, replicationFactor, properties)
               info("Auto creation of topic %s with %d partitions and replication factor %d is successful!"
-                .format(topicMetadata.topic, config.numPartitions, config.defaultReplicationFactor))
-            } catch {
-              case e: TopicExistsException => // let it go, possibly another broker created this topic
+                .format(topicMetadata.topic, numPartitions, replicationFactor))
+              topicsMetadata += new TopicMetadata(topicMetadata.topic, topicMetadata.partitionsMetadata, ErrorMapping.LeaderNotAvailableCode)
             }
-            topicsMetadata += new TopicMetadata(topicMetadata.topic, topicMetadata.partitionsMetadata, ErrorMapping.LeaderNotAvailableCode)
-          } else {
-            topicsMetadata += topicMetadata
+            else
+              topicsMetadata += topicMetadata
+          } catch {
+            case e: Exception =>
+              topicsMetadata += new TopicMetadata(topicMetadata.topic, topicMetadata.partitionsMetadata, ErrorMapping.LeaderNotAvailableCode)
           }
         case _ =>
           debug("Error while fetching topic metadata for topic %s due to %s ".format(topicMetadata.topic,
@@ -626,30 +662,50 @@ class KafkaApis(val requestChannel: RequestChannel,
    */
   def handleOffsetFetchRequest(request: RequestChannel.Request) {
     val offsetFetchRequest = request.requestObj.asInstanceOf[OffsetFetchRequest]
-    val responseInfo = offsetFetchRequest.requestInfo.map( t => {
-      val topicDirs = new ZKGroupTopicDirs(offsetFetchRequest.groupId, t.topic)
-      try {
-        val payloadOpt = ZkUtils.readDataMaybeNull(zkClient, topicDirs.consumerOffsetDir + "/" + t.partition)._1
-        payloadOpt match {
-          case Some(payload) => {
-            (t, OffsetMetadataAndError(offset=payload.toLong, error=ErrorMapping.NoError))
-          } 
-          case None => (t, OffsetMetadataAndError(OffsetMetadataAndError.InvalidOffset, OffsetMetadataAndError.NoMetadata,
-                          ErrorMapping.UnknownTopicOrPartitionCode))
+    val offsetsPartition = OffsetManager.partitionFor(offsetFetchRequest.groupId)
+
+    val responses =
+      if(leaderCache.contains(TopicAndPartition(OffsetManager.OffsetsTopicName, offsetsPartition))) {
+        val leaderId = leaderCache(TopicAndPartition(OffsetManager.OffsetsTopicName, offsetsPartition)).leaderIsrAndControllerEpoch.leaderAndIsr.leader
+        if(leaderId == brokerId) {    // Current broker is the leader for this partition of the offsets topic
+          offsetFetchRequest.requestInfo.map(topicPartition =>
+            (topicPartition, offsetManager.getOffset(new GroupTopicPartition(offsetFetchRequest.groupId, topicPartition))))
         }
-      } catch {
-        case e: Throwable =>
-          (t, OffsetMetadataAndError(OffsetMetadataAndError.InvalidOffset, OffsetMetadataAndError.NoMetadata,
-             ErrorMapping.codeFor(e.getClass.asInstanceOf[Class[Throwable]])))
+        else {      // Some other broker is the leader for the required partition of the offsets topic and we need to forward the request
+          try {
+            if(!offsetFetchChannelPool.contains(leaderId) || !offsetFetchChannelPool.get(leaderId).isConnected) {
+              val broker = aliveBrokers(leaderId)
+              val newChannel = new BlockingChannel(broker.host, broker.port, BlockingChannel.UseDefaultBufferSize, BlockingChannel.UseDefaultBufferSize, 30000)
+              newChannel.connect()
+              offsetFetchChannelPool.put(leaderId, newChannel)
+            }
+
+            val offsetFetchChannel = offsetFetchChannelPool.get(leaderId)
+            val redirectedRequest = offsetFetchRequest.copy(clientId = "broker-" + brokerId.toString)
+            offsetFetchChannel.send(redirectedRequest)
+
+            val response = offsetFetchChannel.receive()
+            val offsetFetchResponse = OffsetFetchResponse.readFrom(response.buffer)
+            offsetFetchResponse.requestInfo.toSeq
+          } catch {
+            case t:Throwable =>
+              offsetFetchRequest.requestInfo.map(topicPartition => (topicPartition, OffsetMetadataAndError.UnknownTopicPartition))
+          }
+        }
+      } else {
+        // We don't know who is the leader for this partition of "offsets topic". Try to create the offsets topic
+        debug("Could not find leader for the partition %d of offsets topic.".format(offsetsPartition))
+        offsetFetchRequest.requestInfo.map(topicPartition => (topicPartition, OffsetMetadataAndError.UnknownTopicPartition))
       }
-    })
-    val response = new OffsetFetchResponse(collection.immutable.Map(responseInfo: _*), 
-                                           offsetFetchRequest.correlationId)
+
+    val response = new OffsetFetchResponse(responses.toMap, offsetFetchRequest.correlationId)
     requestChannel.sendResponse(new RequestChannel.Response(request, new BoundedByteBufferSend(response)))
   }
 
   def close() {
     debug("Shutting down.")
+    if (offsetFetchChannelPool != null)
+      offsetFetchChannelPool.values.foreach(channel => Utils.swallow(channel.disconnect()))
     fetchRequestPurgatory.shutdown()
     producerRequestPurgatory.shutdown()
     debug("Shut down complete.")
@@ -751,7 +807,8 @@ class KafkaApis(val requestChannel: RequestChannel,
           val pstat = partitionStatus(new RequestKey(status._1))
           (status._1, ProducerResponseStatus(pstat.error, pstat.requiredOffset))
         })
-      
+
+      commitIfOffsetsTopic(produce, finalErrorsAndOffsets)
       val response = ProducerResponse(produce.correlationId, finalErrorsAndOffsets)
 
       requestChannel.sendResponse(new RequestChannel.Response(

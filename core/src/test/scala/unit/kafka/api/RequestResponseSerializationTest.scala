@@ -26,7 +26,7 @@ import kafka.cluster.Broker
 import collection.mutable._
 import kafka.common.{TopicAndPartition, ErrorMapping, OffsetMetadataAndError}
 import kafka.controller.LeaderIsrAndControllerEpoch
-
+import kafka.server.OffsetAndMetadata
 
 object SerializationTestUtils{
   private val topic1 = "test1"
@@ -149,7 +149,7 @@ object SerializationTestUtils{
   def createTestOffsetCommitRequest: OffsetCommitRequest = {
     new OffsetCommitRequest("group 1", collection.immutable.Map(
       TopicAndPartition(topic1, 0) -> OffsetMetadataAndError(offset=42L, metadata="some metadata"),
-      TopicAndPartition(topic1, 1) -> OffsetMetadataAndError(offset=100L, metadata=OffsetMetadataAndError.NoMetadata)
+      TopicAndPartition(topic1, 1) -> OffsetMetadataAndError(offset=100L, metadata=OffsetAndMetadata.NoMetadata)
     ))
   }
 
@@ -170,7 +170,7 @@ object SerializationTestUtils{
   def createTestOffsetFetchResponse: OffsetFetchResponse = {
     new OffsetFetchResponse(collection.immutable.Map(
       TopicAndPartition(topic1, 0) -> OffsetMetadataAndError(42L, "some metadata", ErrorMapping.NoError),
-      TopicAndPartition(topic1, 1) -> OffsetMetadataAndError(100L, OffsetMetadataAndError.NoMetadata,
+      TopicAndPartition(topic1, 1) -> OffsetMetadataAndError(100L, OffsetAndMetadata.NoMetadata,
         ErrorMapping.UnknownTopicOrPartitionCode)
     ))
   }

@@ -37,7 +37,8 @@ object OffsetFetchResponse extends Logging {
         val offset = buffer.getLong
         val metadata = readShortString(buffer)
         val error = buffer.getShort
-        (TopicAndPartition(topic, partitionId), OffsetMetadataAndError(offset, metadata, error))
+        val time = buffer.getLong
+        (TopicAndPartition(topic, partitionId), OffsetMetadataAndError(offset, time, metadata, error))
       })
     })
     OffsetFetchResponse(Map(pairs:_*), correlationId)
@@ -59,6 +60,7 @@ case class OffsetFetchResponse(requestInfo: Map[TopicAndPartition, OffsetMetadat
       t1._2.foreach( t2 => { // TopicAndPartition -> OffsetMetadataAndError 
         buffer.putInt(t2._1.partition)
         buffer.putLong(t2._2.offset)
+        buffer.putLong(t2._2.timestamp)
         writeShortString(buffer, t2._2.metadata)
         buffer.putShort(t2._2.error)
       })
@@ -77,6 +79,7 @@ case class OffsetFetchResponse(requestInfo: Map[TopicAndPartition, OffsetMetadat
         innerCount +
         4 /* partition */ +
         8 /* offset */ +
+        8 /* timestamp */ +
         shortStringLength(offsetsAndMetadata._2.metadata) +
         2 /* error */
       })

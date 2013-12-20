@@ -204,7 +204,7 @@ class ReplicaManager(val config: KafkaConfig,
     }
   }
 
-  def becomeLeaderOrFollower(leaderAndISRRequest: LeaderAndIsrRequest): (collection.Map[(String, Int), Short], Short) = {
+  def becomeLeaderOrFollower(leaderAndISRRequest: LeaderAndIsrRequest, offsetManager: OffsetManager): (collection.Map[(String, Int), Short], Short) = {
     leaderAndISRRequest.partitionStateInfos.foreach { case ((topic, partition), stateInfo) =>
       stateChangeLogger.trace("Broker %d received LeaderAndIsr request %s correlation id %d from controller %d epoch %d for partition [%s,%d]"
                                 .format(localBrokerId, stateInfo, leaderAndISRRequest.correlationId,
@@ -254,7 +254,7 @@ class ReplicaManager(val config: KafkaConfig,
           .filter{ case (partition, partitionStateInfo) => partitionStateInfo.leaderIsrAndControllerEpoch.leaderAndIsr.leader == config.brokerId}
         val partitionsTobeFollower = (partitionState -- partitionsTobeLeader.keys)
 
-        if (!partitionsTobeLeader.isEmpty) makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader, leaderAndISRRequest.correlationId, responseMap)
+        if (!partitionsTobeLeader.isEmpty) makeLeaders(controllerId, controllerEpoch, partitionsTobeLeader, leaderAndISRRequest.correlationId, responseMap, offsetManager)
         if (!partitionsTobeFollower.isEmpty) makeFollowers(controllerId, controllerEpoch, partitionsTobeFollower, leaderAndISRRequest.leaders, leaderAndISRRequest.correlationId, responseMap)
 
         // we initialize highwatermark thread after the first leaderisrrequest. This ensures that all the partitions
@@ -282,7 +282,7 @@ class ReplicaManager(val config: KafkaConfig,
    */
   private def makeLeaders(controllerId: Int, epoch: Int,
                           partitionState: Map[Partition, PartitionStateInfo],
-                          correlationId: Int, responseMap: mutable.Map[(String, Int), Short]) = {
+                          correlationId: Int, responseMap: mutable.Map[(String, Int), Short], offsetManager: OffsetManager) = {
     partitionState.foreach(state =>
       stateChangeLogger.trace(("Broker %d handling LeaderAndIsr request correlationId %d from controller %d epoch %d " +
         "starting the become-leader transition for partition %s")
@@ -303,6 +303,11 @@ class ReplicaManager(val config: KafkaConfig,
       partitionState.foreach{ case (partition, partitionStateInfo) =>
         partition.makeLeader(controllerId, partitionStateInfo, correlationId)}
 
+      /** TODO TEJAS
+       * // if this broker is made leader for some partition of offsets' topic, then offset manager must load it
+       * if (topic == OffsetManager.OffsetsTopicName && !leaderPartitions.contains(partition))
+       *  offsetManager.triggerLoadOffsets(partitionId)
+       */
       // Finally add these partitions to the list of partitions for which the leader is the current broker
       leaderPartitionsLock synchronized {
         leaderPartitions ++= partitionState.keySet

@@ -13,16 +13,21 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
-*/
+ */
 
-package kafka.producer
+package kafka.common
 
+/**
+ * A case class for (group, topic, partition) which is used as key by offset manager
+ */
+case class GroupTopicPartition(group: String, topicPartition: TopicAndPartition) {
 
-import kafka.utils._
+  def this(group: String, topic: String, partition: Int) =
+    this(group, new TopicAndPartition(topic, partition))
 
-class DefaultPartitioner(props: VerifiableProperties = null) extends Partitioner {
-  def partition(key: Any, numPartitions: Int): Int = {
-    Utils.abs(key.hashCode) % numPartitions
-  }
+  def this(entry: Array[String]) =
+    this(entry(0), entry(1), entry(2).toInt)
+
+  override def toString =
+    "[%s,%s,%d]".format(group, topicPartition.topic, topicPartition.partition)
 }
-

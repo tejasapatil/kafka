@@ -236,4 +236,18 @@ class KafkaConfig private (val props: VerifiableProperties) extends ZKConfig(pro
   
   /* the maximum size for a metadata entry associated with an offset commit */
   val offsetMetadataMaxSize = props.getInt("offset.metadata.max.bytes", 1024)
+
+  /*********** Consumer offset management configuration ***********/
+
+  /* indicates if consumer offset storage is done inside kafka itself or Zookeeper */
+  val offsetStorage = props.getString("offset.storage", "kafka")
+
+  /* Kafkas' inbuilt offset management creates a special topic (See OffsetManager.OffsetsTopicName)
+     which all the consumers write offsets to. These parameters are for this special offsets topic. */
+  val offsetTopicReplicationFactor: Int = props.getInt("offsets.topic.replication.factor", 1)
+  val offsetTopicPartitions: Int = props.getInt("offsets.topic.num.partitions", 1)
+
+  /* We recommend keeping the offsets topic segment bytes low and enabling the log cleaner to
+     facilitate faster offset loads and reduce the on-disk footprint. Default value is 10 MB */
+  val offsetTopicSegmentBytes: Int = props.getInt("offsets.topic.segment.bytes", 10*1024*1024)
 }

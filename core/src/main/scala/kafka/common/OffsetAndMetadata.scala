@@ -13,16 +13,19 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
-*/
+ */
+package kafka.common
 
-package kafka.producer
-
-
-import kafka.utils._
-
-class DefaultPartitioner(props: VerifiableProperties = null) extends Partitioner {
-  def partition(key: Any, numPartitions: Int): Int = {
-    Utils.abs(key.hashCode) % numPartitions
-  }
+/**
+ * A case class for (offset, metadata) which is used as value by offset manager
+ */
+case class OffsetAndMetadata(offset: Long, timestamp: Long = OffsetAndMetadata.InvalidTime, metadata: String = OffsetAndMetadata.NoMetadata) {
+  def this(entry: Array[String]) = this(entry(0).toLong, entry(1).toLong, entry(2))
+  override def toString = "OffsetAndMetadata[%d,%d,%s]".format(offset, timestamp, metadata)
 }
 
+object OffsetAndMetadata {
+  val InvalidOffset: Long = -1L
+  val NoMetadata: String = ""
+  val InvalidTime: Long = -1L
+}
